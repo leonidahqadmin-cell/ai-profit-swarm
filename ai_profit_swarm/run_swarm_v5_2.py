@@ -24,6 +24,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Dict, Any
+from db import init_db, log_cycle, set_state, get_state
 
 # LLM clients
 try:
@@ -201,6 +202,7 @@ def run_continuous():
         time.sleep(sleep_minutes * 60)
 
 if __name__ == "__main__":
+    init_db()                    # Initialize database tables
     if CONFIG["run_mode"] == "continuous":
         run_continuous()
     else:
