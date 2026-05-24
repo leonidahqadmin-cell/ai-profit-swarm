@@ -1,0 +1,19 @@
+# AI Profit Swarm - Production Requirements
+langgraph>=0.2.0
+crewai>=0.80.0
+langchain>=0.3.0
+openai
+anthropic
+python-dotenv
+requests
+beautifulsoup4
+stripe
+langsmith  # For observability
+pydantic>=2.0
+fastapi  # For API endpoints if needed
+uvicorn
+prometheus_client>=0.20.0  # For metrics exposure
+opentelemetry-api>=1.25.0
+opentelemetry-sdk>=1.25.0
+opentelemetry-exporter-otlp>=1.25.0  # For sending traces (Jaeger, etc.)
+# Add browser automation, email APIs, deployment tools as needed
