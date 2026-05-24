@@ -24,7 +24,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Dict, Any
-from db import init_db, log_cycle, set_state, get_state
+from db import init_db, log_cycle, set_state, get_state, get_recent_cycles
 
 # LLM clients
 try:
@@ -48,6 +48,8 @@ CONFIG = {
     "sleep_minutes": int(os.getenv("SLEEP_MINUTES", "360")),  # Only used in continuous mode
     "default_model": os.getenv("DEFAULT_MODEL", "grok"),
     "log_level": os.getenv("LOG_LEVEL", "INFO"),
+    "improvement_interval": int(os.getenv("IMPROVEMENT_INTERVAL", "5")),  # Run analysis every N cycles
+    "improvement_lookback": int(os.getenv("IMPROVEMENT_LOOKBACK", "15")), # How many cycles to analyze
 }
 
 # Setup clean logging
@@ -181,6 +183,139 @@ def _safe_db(fn, *args, label="db", **kwargs):
         logger.error(f"[DB ERROR] {label} failed: {e}")
         return None
 
+# ==================== SELF-IMPROVEMENT (MVP, read-only) ====================
+#
+# Goal: every IMPROVEMENT_INTERVAL cycles, look at the last N cycles, ask Grok
+# for structured insights, and store them in swarm_state as *advisory* data.
+#
+# This is intentionally read-only — nothing the LLM says will modify prompts or
+# strategies automatically. Insights are surfaced for review only.
+
+def _summarize_recent_cycles(cycles: list) -> dict:
+    """
+    Build a small numeric summary of recent cycles so the LLM gets clean signal
+    instead of a wall of raw JSON. Pure local computation — no LLM call.
+    """
+    if not cycles:
+        return {"count": 0}
+
+    total          = len(cycles)
+    successes      = sum(1 for c in cycles if (c.get("details") or {}).get("status") == "success")
+    failures       = total - successes
+    durations      = [(c.get("metrics") or {}).get("cycle_duration_s", 0) for c in cycles]
+    api_calls      = [(c.get("metrics") or {}).get("api_calls", 0)       for c in cycles]
+    agents_counter = {}
+
+    for c in cycles:
+        for a in (c.get("details") or {}).get("agents_run", []) or []:
+            agents_counter[a] = agents_counter.get(a, 0) + 1
+
+    def _avg(xs): 
+        xs = [x for x in xs if isinstance(x, (int, float))]
+        return round(sum(xs) / len(xs), 2) if xs else 0
+
+    return {
+        "count":                total,
+        "successes":            successes,
+        "failures":             failures,
+        "success_rate":         round(successes / total, 3) if total else 0,
+        "avg_duration_s":       _avg(durations),
+        "avg_api_calls":        _avg(api_calls),
+        "agent_run_frequency":  agents_counter,
+    }
+
+def analyze_and_improve():
+    """
+    MVP self-improvement loop.
+
+    - Pulls the last N cycles from cycle_logs
+    - Computes a small numeric summary locally
+    - Asks Grok for structured insights & recommendations
+    - Stores the resulting insights in swarm_state (read-only advisory data)
+
+    Fully resilient: any failure is logged and swallowed; the main swarm loop
+    is never blocked or crashed by this function.
+    """
+    try:
+        lookback = CONFIG["improvement_lookback"]
+        logger.info(f"[IMPROVE] Running self-analysis on last {lookback} cycles...")
+
+        # 1. Pull recent telemetry
+        try:
+            cycles = get_recent_cycles(lookback) or []
+        except Exception as e:
+            logger.error(f"[IMPROVE] Failed to fetch cycles: {e}")
+            return
+
+        if len(cycles) < 2:
+            logger.info("[IMPROVE] Not enough data yet (need at least 2 cycles). Skipping.")
+            return
+
+        # 2. Local numeric summary (cheap, deterministic)
+        summary = _summarize_recent_cycles(cycles)
+        logger.info(f"[IMPROVE] Local summary: {summary}")
+
+        # 3. Ask Grok for structured insights
+        analysis_prompt = (
+            "You are a senior strategy analyst for an autonomous AI profit swarm. "
+            "You are given a JSON summary of the swarm's recent cycle telemetry. "
+            "Your job is to produce ACTIONABLE, profit-focused insights — not vague observations.\n\n"
+            "Respond ONLY with valid JSON that matches this schema exactly:\n"
+            "{\n"
+            '  "performance_trend": "improving" | "stable" | "declining",\n'
+            '  "best_performing_agents": ["..."],\n'
+            '  "weak_areas": ["..."],\n'
+            '  "recommended_strategy": "short, concrete next-step strategy",\n'
+            '  "improvement_suggestions": ["specific suggestion 1", "specific suggestion 2"],\n'
+            '  "summary": "one-paragraph plain-English summary"\n'
+            "}\n"
+            "Be concrete. Focus on profit generation. No hedging."
+        )
+
+        analysis_task = (
+            "Recent cycle summary:\n"
+            + json.dumps(summary, indent=2)
+            + "\n\nRaw recent cycles (most recent first, truncated):\n"
+            + json.dumps(cycles[:10], indent=2)[:6000]   # cap context size
+        )
+
+        raw = call_llm(analysis_prompt, analysis_task, model="grok")
+
+        # 4. Try to parse JSON; if it fails, keep the raw text as fallback
+        insights = None
+        try:
+            # Strip code fences if the model added them
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`")
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:].strip()
+            insights = json.loads(cleaned)
+        except Exception as parse_err:
+            logger.warning(f"[IMPROVE] Could not parse JSON insights: {parse_err}")
+            insights = {"raw_response": raw[:2000]}
+
+        # 5. Persist as read-only advisory data
+        now_iso = datetime.now().isoformat()
+        _safe_db(set_state, "last_analysis_at",      now_iso,                          label="set last_analysis_at")
+        _safe_db(set_state, "last_analysis_summary", insights.get("summary", "n/a") if isinstance(insights, dict) else "n/a", label="set analysis_summary")
+        _safe_db(set_state, "performance_trend",     insights.get("performance_trend") if isinstance(insights, dict) else None, label="set perf_trend")
+        _safe_db(set_state, "best_performing_agents", insights.get("best_performing_agents", []) if isinstance(insights, dict) else [], label="set best_agents")
+        _safe_db(set_state, "weak_areas",            insights.get("weak_areas", []) if isinstance(insights, dict) else [], label="set weak_areas")
+        _safe_db(set_state, "recommended_strategy",  insights.get("recommended_strategy", "") if isinstance(insights, dict) else "", label="set strategy")
+        _safe_db(set_state, "improvement_suggestions", insights.get("improvement_suggestions", []) if isinstance(insights, dict) else [], label="set suggestions")
+        _safe_db(set_state, "last_analysis_numeric", summary, label="set analysis_numeric")
+        _safe_db(set_state, "analysis_version",      1, label="set analysis_version")
+
+        logger.info(
+            f"[IMPROVE] Insights stored. trend={insights.get('performance_trend') if isinstance(insights, dict) else 'n/a'} "
+            f"| strategy={(insights.get('recommended_strategy') if isinstance(insights, dict) else '')[:80]}"
+        )
+
+    except Exception as e:
+        # Top-level guard — under no circumstances should this break run_cycle()
+        logger.error(f"[IMPROVE] analyze_and_improve failed (non-fatal): {e}")
+
 # ==================== MAIN CYCLE ====================
 
 def run_cycle():
@@ -300,6 +435,15 @@ def run_cycle():
         f"Total leads all-time: {total_leads_so_far} | "
         f"Total cycles: {cycle_number}"
     )
+
+    # ── Self-improvement loop (MVP, read-only) ──────────────────────────────
+    # Runs every IMPROVEMENT_INTERVAL cycles. Fully wrapped — cannot crash run_cycle.
+    interval = CONFIG.get("improvement_interval", 5)
+    if interval > 0 and cycle_number % interval == 0:
+        try:
+            analyze_and_improve()
+        except Exception as e:
+            logger.error(f"[IMPROVE] outer guard caught: {e}")
 
     logger.info("Cycle complete.\n")
 
