@@ -76,3 +76,32 @@ def get_state(key: str, default=None):
     if row:
         return row["value"]
     return default
+
+def get_recent_cycles(limit: int = 10):
+    """
+    Return the most recent N cycle_logs rows as a list of dicts.
+    Used by the self-improvement loop to analyze recent performance.
+    Returns [] if there's nothing to read.
+    """
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT id, timestamp, summary, details, metrics
+        FROM cycle_logs
+        ORDER BY timestamp DESC
+        LIMIT %s
+    """, (limit,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    # Convert timestamps to ISO strings so the result is JSON-safe
+    result = []
+    for r in rows:
+        result.append({
+            "id":        r["id"],
+            "timestamp": r["timestamp"].isoformat() if r["timestamp"] else None,
+            "summary":   r["summary"],
+            "details":   r["details"] or {},
+            "metrics":   r["metrics"] or {},
+        })
+    return result
