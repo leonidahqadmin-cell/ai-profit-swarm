@@ -183,6 +183,25 @@ def run_cycle():
     state["metrics"]["total_tasks_completed"] = state["metrics"].get("total_tasks_completed", 0) + len(state.get("tasks", []))
 
     save_state(state)
+    log_cycle(
+        summary="Profit swarm cycle completed",
+        details={
+            "status": "success",
+            "leads_generated": 0,
+            "actions_taken": 0,
+            "niche_focus": "general"
+        },
+        metrics={
+            "api_calls": 0,
+            "tokens_used": 0,
+            "cycle_number": get_state("total_cycles", 0) + 1
+        }
+    )
+
+    # Update total cycle count in memory
+    set_state("total_cycles", get_state("total_cycles", 0) + 1)
+    set_state("last_cycle_at", datetime.now().isoformat())
+
     logger.info("Cycle complete.\n")
 
 # ==================== RUN MODES ====================
