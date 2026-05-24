@@ -40,6 +40,13 @@ try:
 except ImportError:
     HAS_ANTHROPIC = False
 
+# Tavily for real web search (Phase 2: lead_website actually finds real companies)
+try:
+    from tavily import TavilyClient
+    HAS_TAVILY = True
+except ImportError:
+    HAS_TAVILY = False
+
 # ==================== SIMPLE CONFIGURATION ====================
 # Change these via environment variables when deploying
 
@@ -52,6 +59,8 @@ CONFIG = {
     "improvement_interval": int(os.getenv("IMPROVEMENT_INTERVAL", "5")),  # Run analysis every N cycles
     "improvement_lookback": int(os.getenv("IMPROVEMENT_LOOKBACK", "15")),  # How many cycles to analyze
     "max_leads_per_cycle": int(os.getenv("MAX_LEADS_PER_CYCLE", "100")),  # Sanity cap on hallucinated lead counts
+    "tavily_max_results": int(os.getenv("TAVILY_MAX_RESULTS", "5")),  # How many search results per cycle
+    "tavily_search_query": os.getenv("TAVILY_SEARCH_QUERY", "small business owners needing AI automation help"),  # Default niche query
 }
 
 # Setup clean logging
@@ -66,6 +75,7 @@ print("=== AI PROFIT SWARM v5.2 (Deployment Optimized) ===\n")
 
 GROK_API_KEY = os.getenv("GROK_API_KEY", "")
 CLAUDE_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
 STATE_FILE = "swarm_state.json"
 
@@ -81,29 +91,36 @@ PROMPTS = {
     "orchestrator": "You are the Master Orchestrator of a high-performance autonomous profit system...",
     "lead_website": (
         "You are an expert Lead Generation + Website Building Agent. "
-        "Your job is to propose high-potential prospect candidates for outreach.\n\n"
-        "IMPORTANT — OUTPUT FORMAT:\n"
+        "You will be given REAL web search results about real companies. "
+        "Your job is to extract and structure prospect candidates from those results.\n\n"
+        "CRITICAL — REAL DATA ONLY:\n"
+        "- ONLY include companies that ACTUALLY APPEARED in the search results below.\n"
+        "- Do NOT invent companies, URLs, or contact information.\n"
+        "- If a search result does not contain enough information to form a lead, skip it.\n"
+        "- If the search results are empty or irrelevant, return leads_found = 0.\n\n"
+        "OUTPUT FORMAT:\n"
         "Respond ONLY with valid JSON. No prose, no markdown, no code fences. "
         "Match this schema EXACTLY:\n"
         "{\n"
-        '  "leads_found": <integer between 0 and 20>,\n'
+        '  "leads_found": <integer>,\n'
         '  "leads": [\n'
         "    {\n"
-        '      "company": "string",\n'
-        '      "website": "string (URL or domain)",\n'
-        '      "problem": "string — what business problem they likely have",\n'
-        '      "why_us": "string — why our solution fits them",\n'
-        '      "contact_email": "string or null"\n'
+        '      "company": "string — taken from search results",\n'
+        '      "website": "string — actual URL from search results",\n'
+        '      "problem": "string — inferred business problem based on what the search result says",\n'
+        '      "why_us": "string — why our AI/automation could help them",\n'
+        '      "contact_email": null,\n'
+        '      "source": "tavily",\n'
+        '      "source_url": "string — the URL of the search result this lead came from"\n'
         "    }\n"
         "  ],\n"
-        '  "notes": "string — any caveats, assumptions, or follow-ups"\n'
+        '  "notes": "string — caveats, assumptions, or follow-ups"\n'
         "}\n\n"
         "RULES:\n"
         "- leads_found MUST equal the length of the leads array.\n"
-        "- These are PROSPECT CANDIDATES, not verified contacts. Mark contact_email "
-        "as null unless you are explicitly given a verified source.\n"
-        "- Do NOT fabricate specific email addresses; prefer null.\n"
-        "- Keep each lead concise (one sentence per field is fine)."
+        "- contact_email is ALWAYS null. Do not fabricate emails.\n"
+        "- source is ALWAYS \"tavily\".\n"
+        "- source_url MUST be one of the URLs from the provided search results."
     ),
     "app_factory": "You are the App & SaaS Factory Agent...",
     "aaas_seller": "You are the AI Agent as a Service Sales Agent...",
@@ -205,6 +222,61 @@ def _extract_json(text: str) -> Optional[dict]:
     except Exception:
         return None
 
+# ==================== TAVILY SEARCH (Phase 2: real web search) ====================
+#
+# This block adds REAL web search to the lead_website agent so it can produce
+# leads about companies that actually exist. Behavior on failure: FAIL LOUDLY.
+# If Tavily errors, returns empty results, or the key is missing, the agent
+# will return zero leads and mark lead_source="tavily_failed" — we do NOT
+# silently fall back to LLM-only hallucination.
+
+def tavily_search(query: str, max_results: int = 5) -> list:
+    """
+    Run a Tavily web search. Returns a list of dicts with keys: title, url, content.
+
+    Returns an empty list on ANY error (missing key, missing package, network
+    failure, malformed response). Never raises. The caller is responsible for
+    detecting [] and reacting appropriately.
+    """
+    if not TAVILY_API_KEY:
+        logger.warning("[TAVILY] No TAVILY_API_KEY set — skipping search.")
+        return []
+    if not HAS_TAVILY:
+        logger.warning("[TAVILY] tavily-python package not installed — skipping search.")
+        return []
+    try:
+        client = TavilyClient(api_key=TAVILY_API_KEY)
+        resp = client.search(
+            query=query,
+            max_results=max_results,
+            search_depth="basic",
+        )
+        results = resp.get("results", []) if isinstance(resp, dict) else []
+        clean = []
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            clean.append({
+                "title": (r.get("title") or "")[:200],
+                "url": r.get("url") or "",
+                "content": (r.get("content") or "")[:1000],
+            })
+        logger.info(f"[TAVILY] Got {len(clean)} results for query: {query[:80]!r}")
+        return clean
+    except Exception as e:
+        logger.error(f"[TAVILY] Search failed: {e}")
+        return []
+
+def _build_lead_search_query(state: Dict) -> str:
+    """
+    Build the search query for lead_website.
+
+    Phase 2: starts simple — uses the configured default query. Future versions
+    can derive this dynamically from niche, previous reviewer feedback, or
+    self-improvement insights.
+    """
+    return CONFIG.get("tavily_search_query") or "small business owners needing AI automation help"
+
 # ==================== AGENTS ====================
 
 def orchestrator(state: Dict) -> Dict:
@@ -226,35 +298,86 @@ def execute_agent(state: Dict, agent_name: str, prompt_key: str) -> Dict:
     """
     Run a single agent.
 
-    Phase 1 change: for the lead_website agent we now ALSO try to parse the LLM
-    output as JSON and store the structured result under
-    state["lead_website_structured"]. The raw text is still kept under
-    state["lead_website_output"] for debugging.
+    Phase 1: parses lead_website output as JSON; stores structured result under
+    state["lead_website_structured"]. Raw text kept under state["lead_website_output"].
 
-    On parse failure we log a warning and continue — the cycle is never crashed
-    by a malformed LLM response.
+    Phase 2: for the lead_website agent, we now run a REAL Tavily web search
+    first, then feed the search results to the LLM and ask it to extract
+    structured leads. If Tavily fails, we DO NOT silently fall back to fake
+    leads — we record lead_source="tavily_failed" and return zero leads.
+
+    On JSON parse failure we log a warning and continue — the cycle is never
+    crashed by a malformed LLM response.
     """
     logger.info(f"=== {agent_name.upper()} ===")
     for task in state.get("tasks", []):
-        if task["agent"] == agent_name:
-            output = call_llm(PROMPTS.get(prompt_key, ""), task["task"])
-            state[f"{agent_name}_output"] = output
+        if task["agent"] != agent_name:
+            continue
 
-            # Phase 1: structured-output handling for lead_website only.
-            if agent_name == "lead_website":
-                parsed = _extract_json(output)
-                if parsed is None:
-                    logger.warning(
-                        "[LEAD_WEBSITE] Could not parse JSON from agent output; "
-                        "keeping raw text only. leads_this_cycle will be 0."
-                    )
-                else:
-                    state["lead_website_structured"] = parsed
-                    leads_count_raw = parsed.get("leads_found", 0)
-                    logger.info(
-                        f"[LEAD_WEBSITE] Parsed structured output. "
-                        f"leads_found={leads_count_raw}"
-                    )
+        # ── Phase 2: lead_website now uses real web search ────────────────
+        if agent_name == "lead_website":
+            query = _build_lead_search_query(state)
+            search_results = tavily_search(
+                query=query,
+                max_results=CONFIG.get("tavily_max_results", 5),
+            )
+
+            # FAIL LOUDLY: no fallback to LLM-only hallucination.
+            if not search_results:
+                logger.warning(
+                    "[LEAD_WEBSITE] Tavily returned no results — marking "
+                    "lead_source=tavily_failed and returning zero leads. "
+                    "(This is intentional: we do NOT fall back to fake leads.)"
+                )
+                state["lead_website_output"] = "[TAVILY_FAILED] No search results."
+                state["lead_website_structured"] = {
+                    "leads_found": 0,
+                    "leads": [],
+                    "lead_source": "tavily_failed",
+                    "notes": f"Tavily search returned no usable results for query: {query!r}",
+                }
+                state["lead_website_search_results"] = []
+                return state
+
+            # We have real search results — give them to the LLM for structuring.
+            search_blob = json.dumps(search_results, indent=2)[:6000]
+            task_with_results = (
+                f"Original task: {task['task']}\n\n"
+                f"Search query used: {query}\n\n"
+                f"REAL search results (extract leads ONLY from these):\n{search_blob}"
+            )
+            output = call_llm(PROMPTS.get(prompt_key, ""), task_with_results)
+            state[f"{agent_name}_output"] = output
+            state["lead_website_search_results"] = search_results
+
+            parsed = _extract_json(output)
+            if parsed is None:
+                logger.warning(
+                    "[LEAD_WEBSITE] Could not parse JSON from agent output despite "
+                    "having search results. leads_this_cycle will be 0."
+                )
+                state["lead_website_structured"] = {
+                    "leads_found": 0,
+                    "leads": [],
+                    "lead_source": "parse_failed",
+                    "notes": "LLM returned unparseable output despite real search results.",
+                }
+            else:
+                # Stamp the source so downstream code knows leads came from Tavily.
+                parsed.setdefault("lead_source", "tavily")
+                state["lead_website_structured"] = parsed
+                leads_count_raw = parsed.get("leads_found", 0)
+                logger.info(
+                    f"[LEAD_WEBSITE] Parsed structured output from real search. "
+                    f"leads_found={leads_count_raw} (source=tavily, "
+                    f"{len(search_results)} search results)"
+                )
+            return state
+
+        # ── All other agents: unchanged from Phase 1 ──────────────────────
+        output = call_llm(PROMPTS.get(prompt_key, ""), task["task"])
+        state[f"{agent_name}_output"] = output
+
     return state
 
 def reviewer(state: Dict) -> Dict:
@@ -541,6 +664,13 @@ def run_cycle():
     _safe_db(set_state, "total_leads_generated", prev_leads + leads_this_cycle, label="set total_leads")
     _safe_db(set_state, "last_cycle_leads", leads_this_cycle, label="set last_cycle_leads")
 
+    # Phase 2: track whether the most recent leads came from real search or a failure mode.
+    lead_source = "n/a"
+    structured = state.get("lead_website_structured")
+    if isinstance(structured, dict):
+        lead_source = structured.get("lead_source", "unknown")
+    _safe_db(set_state, "last_lead_source", lead_source, label="set last_lead_source")
+
     # Task 3c: Track which agents ran most recently
     _safe_db(set_state, "last_agents_run", agents_run, label="set last_agents_run")
 
@@ -559,7 +689,7 @@ def run_cycle():
         f"Agents: {len(agents_run)} ({', '.join(agents_run) or 'none'}) | "
         f"API calls: {_cycle_api_calls} | Duration: {cycle_duration_s}s | "
         f"Success streak: {0 if cycle_error else prev_streak + 1} | "
-        f"Leads this cycle: {leads_this_cycle} | "
+        f"Leads this cycle: {leads_this_cycle} (src={lead_source}) | "
         f"Total leads all-time: {total_leads_so_far} | "
         f"Total cycles: {cycle_number}"
     )
