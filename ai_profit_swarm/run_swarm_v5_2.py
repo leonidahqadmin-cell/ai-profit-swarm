@@ -21,9 +21,10 @@ This is the easiest version yet for long-term autonomous operation.
 
 import os
 import json
+import re
 import logging
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from db import init_db, log_cycle, set_state, get_state, get_recent_cycles
 
 # LLM clients
@@ -49,7 +50,8 @@ CONFIG = {
     "default_model": os.getenv("DEFAULT_MODEL", "grok"),
     "log_level": os.getenv("LOG_LEVEL", "INFO"),
     "improvement_interval": int(os.getenv("IMPROVEMENT_INTERVAL", "5")),  # Run analysis every N cycles
-    "improvement_lookback": int(os.getenv("IMPROVEMENT_LOOKBACK", "15")), # How many cycles to analyze
+    "improvement_lookback": int(os.getenv("IMPROVEMENT_LOOKBACK", "15")),  # How many cycles to analyze
+    "max_leads_per_cycle": int(os.getenv("MAX_LEADS_PER_CYCLE", "100")),  # Sanity cap on hallucinated lead counts
 }
 
 # Setup clean logging
@@ -68,10 +70,41 @@ CLAUDE_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 STATE_FILE = "swarm_state.json"
 
 # ==================== PROMPTS ====================
+#
+# Phase 1 (structured output): the lead_website prompt now demands strict JSON.
+# This does NOT mean the agent is doing real lookups — it's still just an LLM
+# making up plausible-looking leads. The structured format exists so we have a
+# stable schema to plug real tools (web search, contact APIs, etc.) into later
+# without changing downstream code.
 
 PROMPTS = {
     "orchestrator": "You are the Master Orchestrator of a high-performance autonomous profit system...",
-    "lead_website": "You are an expert Lead Generation + Website Building Agent...",
+    "lead_website": (
+        "You are an expert Lead Generation + Website Building Agent. "
+        "Your job is to propose high-potential prospect candidates for outreach.\n\n"
+        "IMPORTANT — OUTPUT FORMAT:\n"
+        "Respond ONLY with valid JSON. No prose, no markdown, no code fences. "
+        "Match this schema EXACTLY:\n"
+        "{\n"
+        '  "leads_found": <integer between 0 and 20>,\n'
+        '  "leads": [\n'
+        "    {\n"
+        '      "company": "string",\n'
+        '      "website": "string (URL or domain)",\n'
+        '      "problem": "string — what business problem they likely have",\n'
+        '      "why_us": "string — why our solution fits them",\n'
+        '      "contact_email": "string or null"\n'
+        "    }\n"
+        "  ],\n"
+        '  "notes": "string — any caveats, assumptions, or follow-ups"\n'
+        "}\n\n"
+        "RULES:\n"
+        "- leads_found MUST equal the length of the leads array.\n"
+        "- These are PROSPECT CANDIDATES, not verified contacts. Mark contact_email "
+        "as null unless you are explicitly given a verified source.\n"
+        "- Do NOT fabricate specific email addresses; prefer null.\n"
+        "- Keep each lead concise (one sentence per field is fine)."
+    ),
     "app_factory": "You are the App & SaaS Factory Agent...",
     "aaas_seller": "You are the AI Agent as a Service Sales Agent...",
     "polymarket": "You are the Polymarket Research & Edge Agent...",
@@ -137,6 +170,41 @@ def call_llm(prompt: str, task: str, model: str = None) -> str:
     logger.info(f"{model.upper()} (simulated)")
     return f"[{model.upper()} SIMULATED] Completed task."
 
+# ==================== JSON EXTRACTION HELPER ====================
+#
+# Phase 1: LLMs sometimes wrap JSON in code fences, add prose, or otherwise
+# decorate it. This helper extracts the first plausible JSON object from a
+# string and tries to parse it. Returns None on any failure — never raises.
+
+def _extract_json(text: str) -> Optional[dict]:
+    if not text or not isinstance(text, str):
+        return None
+    cleaned = text.strip()
+
+    # Strip code fences like ```json ... ``` or ``` ... ```
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        # Drop a leading language tag (e.g. "json\n{...}")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].lstrip()
+
+    # Try a direct parse first
+    try:
+        obj = json.loads(cleaned)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    # Fallback: grab the first {...} block we can find
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        obj = json.loads(match.group(0))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
 # ==================== AGENTS ====================
 
 def orchestrator(state: Dict) -> Dict:
@@ -155,11 +223,38 @@ def orchestrator(state: Dict) -> Dict:
     return state
 
 def execute_agent(state: Dict, agent_name: str, prompt_key: str) -> Dict:
+    """
+    Run a single agent.
+
+    Phase 1 change: for the lead_website agent we now ALSO try to parse the LLM
+    output as JSON and store the structured result under
+    state["lead_website_structured"]. The raw text is still kept under
+    state["lead_website_output"] for debugging.
+
+    On parse failure we log a warning and continue — the cycle is never crashed
+    by a malformed LLM response.
+    """
     logger.info(f"=== {agent_name.upper()} ===")
     for task in state.get("tasks", []):
         if task["agent"] == agent_name:
             output = call_llm(PROMPTS.get(prompt_key, ""), task["task"])
             state[f"{agent_name}_output"] = output
+
+            # Phase 1: structured-output handling for lead_website only.
+            if agent_name == "lead_website":
+                parsed = _extract_json(output)
+                if parsed is None:
+                    logger.warning(
+                        "[LEAD_WEBSITE] Could not parse JSON from agent output; "
+                        "keeping raw text only. leads_this_cycle will be 0."
+                    )
+                else:
+                    state["lead_website_structured"] = parsed
+                    leads_count_raw = parsed.get("leads_found", 0)
+                    logger.info(
+                        f"[LEAD_WEBSITE] Parsed structured output. "
+                        f"leads_found={leads_count_raw}"
+                    )
     return state
 
 def reviewer(state: Dict) -> Dict:
@@ -183,6 +278,41 @@ def _safe_db(fn, *args, label="db", **kwargs):
         logger.error(f"[DB ERROR] {label} failed: {e}")
         return None
 
+def _coerce_lead_count(structured: Optional[dict]) -> int:
+    """
+    Phase 1: turn the structured lead_website output into a safe integer.
+
+    - Returns 0 if structured is missing, non-dict, or malformed.
+    - Prefers len(leads) when both leads_found and leads are present and differ.
+    - Caps the final value at CONFIG["max_leads_per_cycle"] so a runaway LLM
+      cannot poison total_leads_generated.
+    """
+    if not isinstance(structured, dict):
+        return 0
+
+    leads_list = structured.get("leads")
+    if isinstance(leads_list, list):
+        count = len(leads_list)
+    else:
+        raw = structured.get("leads_found", 0)
+        try:
+            count = int(raw)
+        except (TypeError, ValueError):
+            count = 0
+
+    if count < 0:
+        count = 0
+
+    cap = CONFIG.get("max_leads_per_cycle", 100)
+    if count > cap:
+        logger.warning(
+            f"[LEAD_WEBSITE] Lead count {count} exceeds cap {cap}; capping. "
+            "(Likely LLM hallucination — investigate prompt.)"
+        )
+        count = cap
+
+    return count
+
 # ==================== SELF-IMPROVEMENT (MVP, read-only) ====================
 #
 # Goal: every IMPROVEMENT_INTERVAL cycles, look at the last N cycles, ask Grok
@@ -199,29 +329,29 @@ def _summarize_recent_cycles(cycles: list) -> dict:
     if not cycles:
         return {"count": 0}
 
-    total          = len(cycles)
-    successes      = sum(1 for c in cycles if (c.get("details") or {}).get("status") == "success")
-    failures       = total - successes
-    durations      = [(c.get("metrics") or {}).get("cycle_duration_s", 0) for c in cycles]
-    api_calls      = [(c.get("metrics") or {}).get("api_calls", 0)       for c in cycles]
+    total = len(cycles)
+    successes = sum(1 for c in cycles if (c.get("details") or {}).get("status") == "success")
+    failures = total - successes
+    durations = [(c.get("metrics") or {}).get("cycle_duration_s", 0) for c in cycles]
+    api_calls = [(c.get("metrics") or {}).get("api_calls", 0) for c in cycles]
     agents_counter = {}
 
     for c in cycles:
         for a in (c.get("details") or {}).get("agents_run", []) or []:
             agents_counter[a] = agents_counter.get(a, 0) + 1
 
-    def _avg(xs): 
+    def _avg(xs):
         xs = [x for x in xs if isinstance(x, (int, float))]
         return round(sum(xs) / len(xs), 2) if xs else 0
 
     return {
-        "count":                total,
-        "successes":            successes,
-        "failures":             failures,
-        "success_rate":         round(successes / total, 3) if total else 0,
-        "avg_duration_s":       _avg(durations),
-        "avg_api_calls":        _avg(api_calls),
-        "agent_run_frequency":  agents_counter,
+        "count": total,
+        "successes": successes,
+        "failures": failures,
+        "success_rate": round(successes / total, 3) if total else 0,
+        "avg_duration_s": _avg(durations),
+        "avg_api_calls": _avg(api_calls),
+        "agent_run_frequency": agents_counter,
     }
 
 def analyze_and_improve():
@@ -276,36 +406,28 @@ def analyze_and_improve():
             "Recent cycle summary:\n"
             + json.dumps(summary, indent=2)
             + "\n\nRaw recent cycles (most recent first, truncated):\n"
-            + json.dumps(cycles[:10], indent=2)[:6000]   # cap context size
+            + json.dumps(cycles[:10], indent=2)[:6000]  # cap context size
         )
 
         raw = call_llm(analysis_prompt, analysis_task, model="grok")
 
         # 4. Try to parse JSON; if it fails, keep the raw text as fallback
-        insights = None
-        try:
-            # Strip code fences if the model added them
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.strip("`")
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:].strip()
-            insights = json.loads(cleaned)
-        except Exception as parse_err:
-            logger.warning(f"[IMPROVE] Could not parse JSON insights: {parse_err}")
-            insights = {"raw_response": raw[:2000]}
+        insights = _extract_json(raw)
+        if insights is None:
+            logger.warning("[IMPROVE] Could not parse JSON insights; storing raw text fallback.")
+            insights = {"raw_response": (raw or "")[:2000]}
 
         # 5. Persist as read-only advisory data
         now_iso = datetime.now().isoformat()
-        _safe_db(set_state, "last_analysis_at",      now_iso,                          label="set last_analysis_at")
+        _safe_db(set_state, "last_analysis_at", now_iso, label="set last_analysis_at")
         _safe_db(set_state, "last_analysis_summary", insights.get("summary", "n/a") if isinstance(insights, dict) else "n/a", label="set analysis_summary")
-        _safe_db(set_state, "performance_trend",     insights.get("performance_trend") if isinstance(insights, dict) else None, label="set perf_trend")
+        _safe_db(set_state, "performance_trend", insights.get("performance_trend") if isinstance(insights, dict) else None, label="set perf_trend")
         _safe_db(set_state, "best_performing_agents", insights.get("best_performing_agents", []) if isinstance(insights, dict) else [], label="set best_agents")
-        _safe_db(set_state, "weak_areas",            insights.get("weak_areas", []) if isinstance(insights, dict) else [], label="set weak_areas")
-        _safe_db(set_state, "recommended_strategy",  insights.get("recommended_strategy", "") if isinstance(insights, dict) else "", label="set strategy")
+        _safe_db(set_state, "weak_areas", insights.get("weak_areas", []) if isinstance(insights, dict) else [], label="set weak_areas")
+        _safe_db(set_state, "recommended_strategy", insights.get("recommended_strategy", "") if isinstance(insights, dict) else "", label="set strategy")
         _safe_db(set_state, "improvement_suggestions", insights.get("improvement_suggestions", []) if isinstance(insights, dict) else [], label="set suggestions")
         _safe_db(set_state, "last_analysis_numeric", summary, label="set analysis_numeric")
-        _safe_db(set_state, "analysis_version",      1, label="set analysis_version")
+        _safe_db(set_state, "analysis_version", 1, label="set analysis_version")
 
         logger.info(
             f"[IMPROVE] Insights stored. trend={insights.get('performance_trend') if isinstance(insights, dict) else 'n/a'} "
@@ -326,9 +448,9 @@ def run_cycle():
     logger.info(f"Starting cycle at {cycle_start.strftime('%Y-%m-%d %H:%M')}")
 
     state = load_state()
-    cycle_error = None          # Track whether this cycle had an error
-    tasks_completed = 0         # How many agent tasks ran
-    agents_run = []             # Which agents were executed
+    cycle_error = None         # Track whether this cycle had an error
+    tasks_completed = 0        # How many agent tasks ran
+    agents_run = []            # Which agents were executed
 
     try:
         state = orchestrator(state)
@@ -336,9 +458,9 @@ def run_cycle():
 
         for agent_name, prompt_key in [
             ("lead_website", "lead_website"),
-            ("app_factory",  "app_factory"),
-            ("aaas_seller",  "aaas_seller"),
-            ("polymarket",   "polymarket"),
+            ("app_factory", "app_factory"),
+            ("aaas_seller", "aaas_seller"),
+            ("polymarket", "polymarket"),
         ]:
             if any(t["agent"] == agent_name for t in tasks_in_cycle):
                 state = execute_agent(state, agent_name, prompt_key)
@@ -361,31 +483,35 @@ def run_cycle():
 
     # ── Derived values for logging ────────────────────────────────────────────
     cycle_duration_s = round((datetime.now() - cycle_start).total_seconds(), 1)
-    cycle_status     = "error" if cycle_error else "success"
-    cycle_number     = (_safe_db(get_state, "total_cycles", 0, label="get total_cycles") or 0) + 1
+    cycle_status = "error" if cycle_error else "success"
+    cycle_number = (_safe_db(get_state, "total_cycles", 0, label="get total_cycles") or 0) + 1
 
-    # TODO: replace with real lead-count variable once lead_website agent returns structured data
-    leads_this_cycle = 0
+    # Phase 1: leads_this_cycle now comes from the lead_website agent's parsed
+    # structured output (set by execute_agent). Falls back to 0 cleanly if the
+    # agent didn't run, produced unparseable output, or returned no leads.
+    # NOTE: this is still LLM-generated content — these are *candidate* leads,
+    # not verified contacts. Wiring up real lookup tools is the next phase.
+    leads_this_cycle = _coerce_lead_count(state.get("lead_website_structured"))
 
     # Task 1: Improved log_cycle() — real data instead of all zeros
     _safe_db(
         log_cycle,
         summary=f"Cycle #{cycle_number} — {cycle_status} — {tasks_completed} agents ran in {cycle_duration_s}s",
         details={
-            "status":          cycle_status,
-            "agents_run":      agents_run,
+            "status": cycle_status,
+            "agents_run": agents_run,
             "tasks_completed": tasks_completed,
-            "niche_focus":     "general",           # TODO: replace with dynamic niche when available
-            "leads_generated": leads_this_cycle,    # TODO: replace with actual variable
-            "error":           cycle_error,         # None if clean run
-            "model_used":      CONFIG["default_model"],
-            "run_mode":        CONFIG["run_mode"],
+            "niche_focus": "general",                  # TODO: replace with dynamic niche when available
+            "leads_generated": leads_this_cycle,       # Phase 1: real count from parsed agent JSON
+            "error": cycle_error,                      # None if clean run
+            "model_used": CONFIG["default_model"],
+            "run_mode": CONFIG["run_mode"],
         },
         metrics={
-            "api_calls":       _cycle_api_calls,    # Real count from call_llm()
-            "tokens_used":     0,                   # TODO: sum token usage from LLM responses
+            "api_calls": _cycle_api_calls,             # Real count from call_llm()
+            "tokens_used": 0,                          # TODO: sum token usage from LLM responses
             "cycle_duration_s": cycle_duration_s,
-            "cycle_number":    cycle_number,
+            "cycle_number": cycle_number,
         },
         label="log_cycle"
     )
@@ -394,25 +520,26 @@ def run_cycle():
     now_iso = datetime.now().isoformat()
 
     # Core counters
-    _safe_db(set_state, "total_cycles",    cycle_number, label="set total_cycles")
-    _safe_db(set_state, "last_cycle_at",   now_iso,      label="set last_cycle_at")
+    _safe_db(set_state, "total_cycles", cycle_number, label="set total_cycles")
+    _safe_db(set_state, "last_cycle_at", now_iso, label="set last_cycle_at")
 
     # Task 3a: Track success / failure streaks and counts
     prev_failed = _safe_db(get_state, "failed_cycles_count", 0, label="get failed_cycles") or 0
     prev_streak = _safe_db(get_state, "current_success_streak", 0, label="get streak") or 0
 
     if cycle_error:
-        _safe_db(set_state, "failed_cycles_count",      prev_failed + 1,  label="set failed_cycles")
-        _safe_db(set_state, "current_success_streak",   0,                label="reset streak")
-        _safe_db(set_state, "last_error",               cycle_error,      label="set last_error")
-        _safe_db(set_state, "last_error_at",            now_iso,          label="set last_error_at")
+        _safe_db(set_state, "failed_cycles_count", prev_failed + 1, label="set failed_cycles")
+        _safe_db(set_state, "current_success_streak", 0, label="reset streak")
+        _safe_db(set_state, "last_error", cycle_error, label="set last_error")
+        _safe_db(set_state, "last_error_at", now_iso, label="set last_error_at")
     else:
-        _safe_db(set_state, "current_success_streak",   prev_streak + 1,  label="set streak")
-        _safe_db(set_state, "last_successful_cycle_at", now_iso,          label="set last_success")
+        _safe_db(set_state, "current_success_streak", prev_streak + 1, label="set streak")
+        _safe_db(set_state, "last_successful_cycle_at", now_iso, label="set last_success")
 
-    # Task 3b: Cumulative leads (TODO: replace 0 with real leads_this_cycle variable)
+    # Task 3b: Cumulative leads — Phase 1 wires the real count through here.
     prev_leads = _safe_db(get_state, "total_leads_generated", 0, label="get total_leads") or 0
     _safe_db(set_state, "total_leads_generated", prev_leads + leads_this_cycle, label="set total_leads")
+    _safe_db(set_state, "last_cycle_leads", leads_this_cycle, label="set last_cycle_leads")
 
     # Task 3c: Track which agents ran most recently
     _safe_db(set_state, "last_agents_run", agents_run, label="set last_agents_run")
@@ -432,6 +559,7 @@ def run_cycle():
         f"Agents: {len(agents_run)} ({', '.join(agents_run) or 'none'}) | "
         f"API calls: {_cycle_api_calls} | Duration: {cycle_duration_s}s | "
         f"Success streak: {0 if cycle_error else prev_streak + 1} | "
+        f"Leads this cycle: {leads_this_cycle} | "
         f"Total leads all-time: {total_leads_so_far} | "
         f"Total cycles: {cycle_number}"
     )
@@ -464,7 +592,7 @@ def run_continuous():
         time.sleep(sleep_minutes * 60)
 
 if __name__ == "__main__":
-    init_db()                    # Initialize database tables
+    init_db()  # Initialize database tables
     if CONFIG["run_mode"] == "continuous":
         run_continuous()
     else:
